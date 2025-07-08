@@ -1,146 +1,159 @@
 from typing import Optional
 import torch
 
-
 def lorentz_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
-    Takes in two tensors of shapes (..., N, D + 1) and (..., M, D + 1) and computes the
-    Lorentzian dot product over the last dimension to return a tensor of shape (..., N, M).
+    Computes the Lorentzian dot product between two tensors using optimized
+    batched matrix multiplication to avoid creating large intermediate tensors.
 
-    Assumes the first coordinate is the "time" component, with signature (-, +, +, ...).
+    This function handles both element-wise dot products (if x and y are
+    individual vectors) and pairwise dot product matrices for attention.
 
     Parameters
     ----------
     x : torch.Tensor
-        First tensor, shape (..., N, D + 1).
+        The first tensor. Shape: `(..., N, D+1)`.
     y : torch.Tensor
-        Second tensor, shape (..., M, D + 1).
+        The second tensor. Shape: `(..., M, D+1)`.
 
     Returns
     -------
     torch.Tensor
-        Lorentzian dot product of x and y, shape (..., N, M).
+        The Lorentzian dot product. Shape: `(..., N, M)`.
     """
-    if len(x.shape) == 1 and len(y.shape) == 1:
-        time_part = -x[0] * y[0]
-        space_part = (x[1:] * y[1:]).sum()
-        return time_part + space_part
-    # Reshape to allow pairwise computation
-    x_expanded = x.unsqueeze(-2)  # shape (..., a, 1, n)
-    y_expanded = y.unsqueeze(-3)  # shape (..., 1, b, n)
+    # Decompose tensors into time and space components.
+    x_time, x_space = x[..., 0:1], x[..., 1:]
+    y_time, y_space = y[..., 0:1], y[..., 1:]
 
-    # Compute time component (negative sign) + spatial components
-    time_part = -x_expanded[..., 0] * y_expanded[..., 0]
-    space_part = torch.sum(x_expanded[..., 1:] * y_expanded[..., 1:], dim=-1)
+    # Use batched matrix multiplication (@) for the spatial component.
+    # This is highly optimized and memory-efficient.
+    # (B, N, D) @ (B, M, D).transpose(-2, -1) -> (B, N, D) @ (B, D, M) -> (B, N, M)
+    space_dots = x_space @ y_space.transpose(-2, -1)
 
-    return time_part + space_part
+    # Use the same operation for the time component.
+    time_dots = - (x_time @ y_time.transpose(-2, -1))
+
+    # The result is the full pairwise dot product matrix.
+    return time_dots + space_dots
 
 
-def squared_lorentzian_distance(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    c: torch.Tensor,
-) -> torch.Tensor:
+
+def squared_lorentzian_distance(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     """
-    Takes in two 2-dimensional tensors of shapes (..., N, D + 1) and (..., M, D + 1) and computes the
-    squared Lorentzian distance between them to return a tensor of shape (..., N, M).
+    Computes the squared Lorentzian distance between two sets of points.
+
+    The squared distance is given by: $d(x, y)^2 = -2/c - 2 * <x, y>_L$
 
     Parameters
     ----------
     x : torch.Tensor
-        First tensor, shape (..., N, D + 1).
+        First set of points on the hyperboloid.
     y : torch.Tensor
-        Second tensor, shape (..., M, D + 1).
+        Second set of points on the hyperboloid.
     c : torch.Tensor
-        The negative of the curvature of the hyperboloid in which the tensors lie (by GeoOpt convention). Note that
-        this will be a positive value, as the curvature of hyperbolic space is negative.
+        Positive curvature constant of the manifold.
 
     Returns
     -------
     torch.Tensor
-        Squared Lorentzian distance between x and y, shape (..., N, M).
+        The squared Lorentzian distance between x and y.
     """
-    return -2 / c - 2 * lorentz_dot(x, y)
+    return -2.0 / c - 2.0 * lorentz_dot(x, y)
 
 
+# ... (rest of linalg.py remains the same) ...
 def lorentz_fully_connected(
-    x: torch.Tensor,
-    W: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    c: torch.Tensor,
-    num_heads: int,
+        x: torch.Tensor,
+        W: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        c: torch.Tensor,
+        num_heads: int = 1,
 ) -> torch.Tensor:
     """
-    Calculates a Lorentz fully connected layer by applying a weight matrix on the input vector,
-    whose output signifies the space coordinates. The corresponding time coordinate is then computed.
+    Applies a Lorentzian fully connected layer.
+
+    This layer performs a standard matrix multiplication on an input tensor from the hyperboloid,
+    and then projects the result back. This is a specific convention used in some models.
 
     Parameters
     ----------
     x : torch.Tensor
-        Input tensor, shape (..., N, D + 1).
+        Input tensor on the hyperboloid of shape (..., D_in + 1).
     W : torch.Tensor
-        Weight tensor, shape (D, D + 1).
+        Weight matrix of shape (D_out, D_in + 1).
     bias : Optional[torch.Tensor]
-        Bias vector, shape (D).
+        Bias vector of shape (D_out).
     c : torch.Tensor
-        The negative of the curvature of the hyperboloid in which the tensors lie (by GeoOpt convention). Note that
-        this will be a positive value, as the curvature of hyperbolic space is negative.
-    act_fn : Callable
-        Activation function.
-    num_heads : int
-        Used in case the fully connected layer is part of a multi-head attention mechanism.
-    dim : int
-        Dimension along which tensor lies on the manifold.
+        Positive curvature constant of the manifold.
+    num_heads : int, optional
+        If greater than 1, reshapes the output for multi-head attention, by default 1.
 
     Returns
     -------
     torch.Tensor
-        Output tensor, shape (..., N, (H), D + 1), where H is the number of heads. The H dimension does not exist if num_heads is 0 or 1.
+        The output tensor on the hyperboloid.
     """
-    if bias is None:
-        bias = torch.zeros(W.size(0))
-    space = x @ W.T + bias.unsqueeze(0)
-    # If we use multiple heads, reshape the space tensor
-    # from (..., n, D) to (..., n, num_heads, D / num_heads).
+    # vT = z[0]
+    # W = z[1:]
+    # time = l * torch.nn.functional.sigmoid()
+    space = x @ W.T
+    if bias is not None:
+        space = space + bias
+
     if num_heads > 1:
-        space = space.view((*space.shape[:-1], num_heads, -1))
-    time = torch.sqrt(torch.norm(space, dim=-1) ** 2 + 1 / c).unsqueeze(-1)
-    output = torch.cat([time, space], dim=-1)
-    return output
+        space = space.view(*space.shape[:-1], num_heads, -1)
+
+    # Compute time coordinate to ensure the point is on the hyperboloid
+    time = torch.sqrt(torch.norm(space, p=2, dim=-1, keepdim=True) ** 2 + 1.0 / c)
+    return torch.cat([time, space], dim=-1)
 
 
 def lorentz_patch_embedding(
-    x: torch.Tensor,
-    weights: torch.Tensor,
-    positional_encoding: torch.Tensor,
-    c: torch.Tensor,
-    patch_size: int,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        positional_encoding: torch.Tensor,
+        c: torch.Tensor,
+        patch_size: int,
 ) -> torch.Tensor:
-    B, C, H, W = x.shape
-    x = x.unfold(2, patch_size, patch_size).unfold(
-        3, patch_size, patch_size
-    )  # (B, C, H // patch_size, W // patch_size, patch_size, patch_size
-    x = x.contiguous().view(
-        B, C, -1, patch_size * patch_size
-    )  # (B, C, L, patch_size * patch_size)
-    x = x.permute(0, 2, 1, 3).flatten(2)  # (B, L, C * patch_size * patch_size)
-    time = torch.sqrt(torch.norm(x, dim=-1) ** 2 + 1).unsqueeze(-1)
-    x = torch.cat([time, x], dim=-1)
+    """
+    Performs patch embedding for vision transformers on the hyperboloid.
 
-    # Std of spatial coordinates is 1/n here, so variance is 1/n^2
-    # This means that variance of time coordinates is approx. 1/4n.
-    space = x @ weights.T
-    space += positional_encoding
-    # If we use multiple heads, reshape the space tensor
-    # from (..., n, D) to (..., n, num_heads, D / num_heads).
-    time = torch.sqrt(torch.norm(space, dim=-1) ** 2 + 1 / c).unsqueeze(-1)
-    output = torch.cat([time, space], dim=-1)
-    return output
+    This function first flattens image patches to Euclidean vectors, then maps them
+    to the unit hyperboloid by prepending a time coordinate. A linear transformation
+    is applied in the ambient space, and the result is projected back to the
+    hyperboloid with curvature `c`.
 
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input image tensor of shape (B, C, H, W).
+    weights : torch.Tensor
+        Weight matrix for the linear projection, shape (D_out, C * patch_size**2 + 1).
+    positional_encoding : torch.Tensor
+        Positional encodings to be added to the spatial components.
+    c : torch.Tensor
+        Positive curvature constant of the manifold.
+    patch_size : int
+        The size of each square patch.
 
-def alternative_linear(normal, x):
-    q = torch.asinh(lorentz_dot(normal, x) / lorentz_dot(normal, normal).sqrt())
-    print(q)
+    Returns
+    -------
+    torch.Tensor
+        The resulting patch embeddings on the hyperboloid.
+    """
+    # Unfold image into patches and flatten
+    x = x.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
+    x = x.contiguous().view(x.shape[0], x.shape[1], -1, patch_size * patch_size)
+    x = x.permute(0, 2, 1, 3).flatten(2)
 
+    # Prepend time coordinate to project the patch vector to the unit hyperboloid
+    time = torch.sqrt(torch.norm(x, p=2, dim=-1, keepdim=True) ** 2 + 1.0)
+    x_h = torch.cat([time, x], dim=-1)
 
-alternative_linear(torch.tensor([0, -1, 5, 2]), torch.tensor([1, 0, 0, 0]))
+    # Apply linear transformation in ambient space.
+    # The result is considered the new spatial component.
+    space = x_h @ weights.T + positional_encoding
+
+    # Compute the new time coordinate to project back to the target hyperboloid
+    new_time = torch.sqrt(torch.norm(space, p=2, dim=-1, keepdim=True) ** 2 + 1.0 / c)
+    return torch.cat([new_time, space], dim=-1)

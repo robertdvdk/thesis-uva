@@ -15,6 +15,8 @@ from .modules.hypformer import (
     HypLinear,
     HypCLS,
 )
+from .modules.patchembedding import HPatchEmbedding
+from .modules.activation import HypReLU
 
 __all__ = [
     "HReLU",

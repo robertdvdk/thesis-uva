@@ -54,15 +54,14 @@ class Seq2SeqTransformer(nn.Module):
         self.generator = nn.Linear(d_model, tgt_vocab_size)
         self.src_tok_emb = nn.Embedding(src_vocab_size, d_model)
         self.tgt_tok_emb = nn.Embedding(tgt_vocab_size, d_model)
-        self.src_positional_encoding = PositionalEncoding(d_model, dropout)
-        self.tgt_positional_encoding = PositionalEncoding(d_model, dropout)
+        self.positional_encoding = PositionalEncoding(d_model, dropout)
         self.d_model = d_model
 
     def generate_square_subsequent_mask(self, sz: int, device: torch.device) -> torch.Tensor:
         """Generates a causal mask for the decoder."""
         return torch.triu(torch.full((sz, sz), float('-inf'), device=device), diagonal=1)
 
-    def encode(self, src: torch.Tensor, src_padding_mask: torch.Tensor) -> torch.Tensor:
+    def encode(self, src: torch.Tensor, src_key_padding_mask: torch.Tensor) -> torch.Tensor:
         """
         Encodes the source sequence.
         Args:
@@ -71,9 +70,9 @@ class Seq2SeqTransformer(nn.Module):
         Returns:
             torch.Tensor: The encoder's output memory.
         """
-        src_emb = self.src_positional_encoding(self.src_tok_emb(src) * math.sqrt(self.d_model))
+        src_emb = self.positional_encoding(self.src_tok_emb(src) * math.sqrt(self.d_model))
         # The nn.Transformer.encoder expects padding masks where True indicates a padded token. Invert it.
-        src_key_padding_mask = (src_padding_mask == 0)
+        src_key_padding_mask = (src_key_padding_mask == 0)
         return self.transformer.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
 
     def decode(self, tgt: torch.Tensor, memory: torch.Tensor, tgt_mask: torch.Tensor,
@@ -89,7 +88,7 @@ class Seq2SeqTransformer(nn.Module):
         Returns:
             torch.Tensor: Raw output from the decoder.
         """
-        tgt_emb = self.tgt_positional_encoding(self.tgt_tok_emb(tgt) * math.sqrt(self.d_model))
+        tgt_emb = self.positional_encoding(self.tgt_tok_emb(tgt) * math.sqrt(self.d_model))
 
         if tgt_padding_mask is not None:
             tgt_padding_mask = (tgt_padding_mask == 0)

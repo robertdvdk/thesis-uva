@@ -107,16 +107,16 @@ class HypLinear(nn.Module):
 
 
 class HypCLS(nn.Module):
-    def __init__(self, manifold, in_channels, out_channels, bias=True):
+    def __init__(self, manifold, in_features, out_features, bias=True):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        self.in_features = in_features
+        self.out_features = out_features
         self.manifold = manifold
-        cls_emb = torch.randn((self.out_channels, self.in_channels)) * (1. / math.sqrt(self.in_channels + 1))
-        cls_emb = expmap0(cls_emb, c=self.manifold.c, man_dim=-1)
+        cls_emb = torch.randn((self.out_features, self.in_features)) * (1. / math.sqrt(self.in_features + 1))
+        cls_emb = expmap0(cls_emb, c=self.manifold.c.value, man_dim=1)
         self.cls = ManifoldParameter(cls_emb, self.manifold, man_dim=-1, requires_grad=True)
         if bias:
-            self.bias = nn.Parameter(torch.zeros(self.out_channels))
+            self.bias = nn.Parameter(torch.zeros(self.out_features))
 
     def forward(self, x, return_type='neg_dist'):
         dist = -2 * 1 - 2 * lorentz_dot(x.tensor, self.cls.tensor) + self.bias

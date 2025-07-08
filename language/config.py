@@ -6,7 +6,7 @@ Central configuration file for the Transformer project.
 
 CONFIG = {
     # --- Run Identification & Checkpointing ---
-    "run_name": "hyperbolic_transformer_v4_shared_vocab",
+    "run_name": "hyp_test",
     "load_model_path": None,
 
     # --- Data & Tokenizer Parameters ---
@@ -22,6 +22,10 @@ CONFIG = {
     "num_decoder_layers": 6,
     "dim_feedforward": 256,
     "dropout": 0.1,
+
+    # --- Geometry Configuration ---
+    "manifold": "Euclidean",  # Options: "Euclidean" or "hyperboloid"
+    "curvature": 1.0,
 
     # --- Training & Optimization Parameters (Step-Based) ---
     # --- MODIFIED: from epochs to steps ---
