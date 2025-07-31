@@ -3,10 +3,8 @@ from torch import nn
 from hypll.manifolds import Manifold
 from hypll.tensors import ManifoldTensor, TangentTensor
 from hypll.utils.layer_utils import check_if_man_dims_match, check_if_manifolds_match
-
-from .linear import HLinear
 import torch
-
+from .linear import HLinear
 
 class HMultiHeadAttention(nn.Module):
     """
@@ -38,7 +36,6 @@ class HMultiHeadAttention(nn.Module):
 
         if embed_dim % num_heads != 0:
             raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
-
         # --------------------------------------------------------------------
         # Define layers based on the chosen implementation
         # --------------------------------------------------------------------
@@ -47,7 +44,7 @@ class HMultiHeadAttention(nn.Module):
             # and Output projections internally.
             self.attn = nn.MultiheadAttention(embed_dim, num_heads, bias=bias, batch_first=True)
 
-        elif self.impl == "naive":
+        elif self.impl == "naive" or self.impl == "chen" or self.impl == "correction":
             # For the naive hyperbolic implementation, we must define our own
             # projection layers for each head to operate on the full manifold vectors.
             self.head_dim = embed_dim // num_heads
@@ -112,7 +109,7 @@ class HMultiHeadAttention(nn.Module):
         # --------------------------------------------------------------------
         # Naive (Fully Hyperbolic) Implementation
         # --------------------------------------------------------------------
-        elif self.impl == "naive":
+        elif self.impl == "naive" or self.impl == "chen" or self.impl == "correction":
             # 1. Compute attention for each head in parallel.
             head_outputs = []
             for i in range(self.num_heads):
@@ -135,96 +132,3 @@ class HMultiHeadAttention(nn.Module):
             # 3. Apply the final output projection.
             output = self.out_proj(concatenated_heads)
             return output
-
-
-# class HMultiHeadAttention(nn.Module):
-#     """
-#     Lorentzian multi-head attention layer, as defined by Chen et al.
-#     """
-#
-#     def __init__(
-#         self,
-#         embed_dim: int,
-#         num_heads: int,
-#         manifold: Manifold,
-#         bias: bool = True,
-#     ) -> None:
-#         super(HMultiHeadAttention, self).__init__()
-#         self.embed_dim = embed_dim
-#         self.num_heads = num_heads
-#         self.manifold = manifold
-#         self.has_bias = bias
-#
-#         self.W_Q = HLinear(
-#             in_features=embed_dim,
-#             out_features=embed_dim,
-#             manifold=manifold,
-#             bias=bias,
-#             num_heads=num_heads,
-#         )
-#         self.W_K = HLinear(
-#             in_features=embed_dim,
-#             out_features=embed_dim,
-#             manifold=manifold,
-#             bias=bias,
-#             num_heads=num_heads,
-#         )
-#         self.W_V = HLinear(
-#             in_features=embed_dim,
-#             out_features=embed_dim,
-#             manifold=manifold,
-#             bias=bias,
-#             num_heads=num_heads,
-#         )
-#         self.W_O = HLinear(
-#             in_features=embed_dim,
-#             out_features=embed_dim,
-#             manifold=manifold,
-#             bias=bias,
-#             num_heads=0,
-#         )
-#         self.reset_parameters()
-#
-#     def reset_parameters(self) -> None:
-#         self.W_Q.reset_parameters()
-#         self.W_K.reset_parameters()
-#         self.W_V.reset_parameters()
-#         self.W_O.reset_parameters()
-#
-#     def forward(
-#         self, query: ManifoldTensor, key: ManifoldTensor, value: ManifoldTensor, key_padding_mask = None, attn_mask = None
-#     ) -> ManifoldTensor:
-#         """
-#         Given query, key, and value tensors, compute the multi-head attention in the manifold on which the tensors lie.
-#
-#         Parameters
-#         ----------
-#         query : ManifoldTensor
-#             Query tensor, (B, L, D).
-#         key : ManifoldTensor
-#             Key tensor, (B, L, D).
-#         value : ManifoldTensor
-#             Value tensor, (B, L, D).
-#
-#         Returns
-#         -------
-#         ManifoldTensor
-#             Multi-head attention output tensor, (B, L, D).
-#         """
-#         check_if_manifolds_match(layer=self, input=query)
-#         check_if_manifolds_match(layer=self, input=key)
-#         check_if_manifolds_match(layer=self, input=value)
-#         check_if_man_dims_match(layer=self, man_dim=-1, input=query)
-#         check_if_man_dims_match(layer=self, man_dim=-1, input=key)
-#         check_if_man_dims_match(layer=self, man_dim=-1, input=value)
-#         return self.manifold.multiheadattention(
-#             query=query,
-#             key=key,
-#             value=value,
-#             W_Q=self.W_Q,
-#             W_K=self.W_K,
-#             W_V=self.W_V,
-#             W_O=self.W_O,
-#             key_padding_mask=key_padding_mask,
-#             attn_mask=attn_mask
-#         )

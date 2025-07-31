@@ -44,6 +44,7 @@ class RiemannianAdam(Optimizer):
 
     def step(self, param_to_name) -> None:
         # TODO: refactor this and add some comments, because it's currently unreadable
+        rn = 0
         with no_grad():
             for group in self.param_groups:
                 betas = group["betas"]
@@ -56,6 +57,7 @@ class RiemannianAdam(Optimizer):
                     if isinstance(param, ManifoldParameter):
                         manifold: Manifold = param.manifold
                         grad = param.grad
+
                         if grad is None:
                             continue
                         grad = ManifoldTensor(
@@ -89,11 +91,12 @@ class RiemannianAdam(Optimizer):
                             denom = max_exp_avg_sq.div(bias_correction2).sqrt_()
                         else:
                             denom = exp_avg_sq.div(bias_correction2).sqrt_()
-
                         # --- MINIMAL CHANGE ---
                         if correction and param.dim() > 1:
                             row_norms = param.data.norm(p=2, dim=1, keepdim=True)
                             effective_lr = lr * row_norms
+                            if row_norms.max() > rn:
+                                rn = row_norms.max()
                         else:
                             effective_lr = lr
 
@@ -112,12 +115,12 @@ class RiemannianAdam(Optimizer):
                             manifold=manifold,
                             man_dim=param.man_dim,
                         )
+
                         new_param = manifold.expmap(direction)
                         exp_avg_new = manifold.transp(v=exp_avg_man, y=new_param)
                         param.tensor.copy_(new_param.tensor)
                         exp_avg.copy_(exp_avg_new.tensor)
                     else:
-
                         grad = param.grad
                         if grad is None:
                             continue
@@ -146,7 +149,6 @@ class RiemannianAdam(Optimizer):
                             denom = max_exp_avg_sq.div(bias_correction2).sqrt_()
                         else:
                             denom = exp_avg_sq.div(bias_correction2).sqrt_()
-
                         direction = exp_avg.div(bias_correction1) / denom.add_(eps)
 
                         new_param = param - lr * direction
@@ -154,3 +156,4 @@ class RiemannianAdam(Optimizer):
 
                         param.copy_(new_param)
                         exp_avg.copy_(exp_avg_new)
+        return rn

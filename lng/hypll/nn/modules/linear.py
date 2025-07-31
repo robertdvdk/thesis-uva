@@ -1,7 +1,8 @@
 from torch import nn
+from typing import Optional
 
 from hypll.manifolds import Manifold
-from hypll.tensors import ManifoldTensor
+from hypll.tensors import ManifoldTensor, TangentTensor
 from hypll.utils.layer_utils import check_if_man_dims_match, check_if_manifolds_match
 
 

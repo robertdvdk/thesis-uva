@@ -43,7 +43,7 @@ def expmap0(v: Tensor, c: Tensor, man_dim: int) -> Tensor:
     space = (torch.sinh(v_norm) / (v_norm + 1e-5)).unsqueeze(-1) * v_tran
 
     # Concatenate time and space coords, and transpose back to original dim order.
-    space[..., 0] = time.squeeze()
+    space[..., 0] = time.squeeze(-1)
     return space.transpose(dim0=man_dim, dim1=-1)
 
 
@@ -118,7 +118,8 @@ def logmap0(y: Tensor, c: Tensor) -> Tensor:
 
     # Clamp y_0 to prevent NaNs in acosh for values slightly less than 1
     # due to floating-point precision errors.
-    y_0 = y[..., 0:1].clamp(min=1.0)
+    eps = 1e-8
+    y_0 = y[..., 0:1].clamp(min=1.0 + eps)
     y_spatial = y[..., 1:]
 
     # The distance 'd' is the norm of the tangent vector we want to find.

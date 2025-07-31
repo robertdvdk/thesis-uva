@@ -139,13 +139,15 @@ class Hyperboloid(Manifold):
 
     def fully_connected(self, x: ManifoldTensor, z: ManifoldTensor, bias: Optional[Tensor], l: float, dropout: nn.Module, impl: str):
         if impl == "tangent":
+            # space = x @ z.tensor.T
             space = self.logmap(y=x).tensor @ z.tensor.T
             if bias is not None:
                 space += bias
             time = torch.zeros(space.shape[:-1], device=x.device).unsqueeze(-1)
             tangent = TangentTensor(data=torch.cat([time, space], dim=x.man_dim), manifold=self, man_dim=x.man_dim)
             return self.expmap(tangent)
-        elif impl == "naive":
+            # return space
+        elif impl == "naive" or impl == "correction":
             space = x.tensor @ z.tensor.T
             if bias is not None:
                 space += bias
@@ -154,6 +156,7 @@ class Hyperboloid(Manifold):
         elif impl == "chen":
             vT = z.tensor[0]
             W = z.tensor[1:]
+            bias = bias.squeeze()
             b_0 = bias[0]
             eps = (1. / self.c()).sqrt() + 1e-6
             time = l * F.sigmoid(x.tensor @ vT + b_0) + eps
@@ -171,16 +174,23 @@ class Hyperboloid(Manifold):
                            key_padding_mask: Optional[Tensor] = None,
                            attn_mask: Optional[Tensor] = None):
         if impl == "tangent":
-            query_tangent = self.logmap(y=query)
-            key_tangent = self.logmap(y=key)
-            value_tangent = self.logmap(y=value)
-            attn_output = torch.zeros_like(query_tangent.tensor)
-            attn_output[..., 1:], attn_output_weights = att_module(query=query_tangent.tensor[..., 1:], key=key_tangent.tensor[..., 1:], value=value_tangent.tensor[..., 1:], key_padding_mask=key_padding_mask, attn_mask=attn_mask)
+            query = query.transpose(0, 1)
+            key = key.transpose(0, 1)
+            value = value.transpose(0, 1)
+            # query_tangent = self.logmap(y=query)
+            # key_tangent = self.logmap(y=key)
+            # value_tangent = self.logmap(y=value)
+            # attn_output = torch.zeros_like(query_tangent.tensor)
+            attn_output, attn_output_weights = att_module(query=query[..., 1:],
+                                                                   key=key[..., 1:],
+                                                                   value=value[..., 1:],
+                                                                   key_padding_mask=key_padding_mask,
+                                                                   attn_mask=attn_mask)
 
-            output_tangent = TangentTensor(attn_output, manifold=self, man_dim=query.man_dim)
-            output = self.expmap(output_tangent)
-            return output
-        elif impl == "naive":
+            # output_tangent = TangentTensor(attn_output, manifold=self, man_dim=query.man_dim)
+            # output = self.expmap(output_tangent)
+            return attn_output
+        elif impl == "naive" or impl == "correction":
             # The "naive" implementation follows the algorithm outlined in
             # "Fully Hyperbolic Neural Networks" by Chen et al. (2022).
             # It computes attention weights based on squared Lorentzian distance
@@ -228,7 +238,6 @@ class Hyperboloid(Manifold):
 
             return output
 
-
     def midpoint(
         self,
         x: ManifoldTensor,
@@ -269,21 +278,6 @@ class Hyperboloid(Manifold):
 
     def inner(self, u, v, dim=-1, keepdim=False, safe_mode=False):
         return self.minkowski_dot(u.tensor, v.tensor, dim=dim, keepdim=keepdim)
-
-    # def minkowski_dot(
-    #     self, x: Tensor, y: Tensor, dim: int = -1, keepdim: bool = False
-    # ) -> Tensor:
-    #     """
-    #     Computes the Minkowski dot product in (-, +, +, ..., +) signature
-    #     along the specified dimension 'dim'.
-    #     """
-    #     # Split off the first coordinate (time-like) and the remaining space-like coordinates
-    #     time_x, space_x = x.split([1, x.size(dim) - 1], dim=dim)
-    #     time_y, space_y = y.split([1, y.size(dim) - 1], dim=dim)
-    #
-    #     # Minkowski dot: - x0*y0 + sum_{i=1 to d} x_i*y_i
-    #     dot = -time_x * time_y + (space_x * space_y).sum(dim=dim, keepdim=keepdim)
-    #     return dot
 
     def euc_to_tangent(
         self, x: ManifoldTensor, u: ManifoldTensor, dim: int = -1
@@ -414,31 +408,11 @@ class Hyperboloid(Manifold):
         return cdist(x=x.tensor, y=y.tensor, c=self.c())
 
     def cat(
-            self,
-            manifold_tensors: Union[Tuple[ManifoldTensor, ...], List[ManifoldTensor]],
-            impl: str,
-            dim: int = 0,
+        self,
+        manifold_tensors: Union[Tuple[ManifoldTensor, ...], List[ManifoldTensor]],
+        impl: str,
+        dim: int = 0,
     ) -> ManifoldTensor:
-        """
-        Concatenates a sequence of ManifoldTensors along a given dimension.
-
-        The behavior depends on the chosen implementation and whether the
-        concatenation is along the manifold dimension.
-
-        Parameters
-        ----------
-        manifold_tensors : Union[Tuple[ManifoldTensor, ...], List[ManifoldTensor]]
-            The sequence of tensors to concatenate.
-        impl : str
-            The implementation to use ("naive" or "tangent").
-        dim : int, optional
-            The dimension along which to concatenate, by default 0.
-
-        Returns
-        -------
-        ManifoldTensor
-            The resulting concatenated tensor.
-        """
         check_if_man_dims_match(manifold_tensors)
         man_dim = manifold_tensors[0].man_dim
 
@@ -448,7 +422,7 @@ class Hyperboloid(Manifold):
 
         # --- Case 1: Concatenating along the manifold dimension ---
         if resolved_dim == man_dim:
-            if impl == "naive":
+            if impl == "naive" or impl == "correction":
                 # In the naive case, we concatenate the spatial dimensions and
                 # calculate a new time dimension to ensure the result is on the manifold.
                 tensors = [t.tensor for t in manifold_tensors]
