@@ -243,14 +243,6 @@ class PoincareBall(Manifold):
             keepdim=keepdim,
         )
 
-    def patch_embedding(
-        self,
-        x: ManifoldTensor,
-        z: ManifoldTensor,
-        positional_encoding: Optional[Tensor],
-    ) -> ManifoldTensor:
-        raise NotImplementedError
-
     def construct_dl_parameters(
         self, in_features: int, out_features: int, bias: bool = True
     ) -> tuple[ManifoldParameter, Optional[Parameter]]:

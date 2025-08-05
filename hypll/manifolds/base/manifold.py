@@ -54,15 +54,6 @@ class Manifold(Module, ABC):
     ) -> ManifoldTensor:
         raise NotImplementedError
 
-    @abstractmethod
-    def patch_embedding(
-        self,
-        x: ManifoldTensor,
-        z: ManifoldTensor,
-        positional_encoding: Optional[Tensor],
-    ) -> ManifoldTensor:
-        raise NotImplementedError
-
     # @abstractmethod
     # def frechet_mean(
     #     self,

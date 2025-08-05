@@ -13,25 +13,23 @@ class HLinear(nn.Module):
         in_features: int,
         out_features: int,
         manifold: Manifold,
+        impl: str,
         bias: bool = True,
-        num_heads: int = 0,
+        p_dropout: float = 0.0,
     ) -> None:
         super(HLinear, self).__init__()
-        if num_heads > 0 and out_features % num_heads != 0:
-            raise ValueError(
-                f"out_features must be divisible by num_heads, got {out_features} and {num_heads}"
-            )
         self.in_features = in_features
         self.out_features = out_features
         self.manifold = manifold
         self.has_bias = bias
-        self.num_heads = num_heads
         # TODO: torch stores weights transposed supposedly due to efficiency
         # https://discuss.pytorch.org/t/why-does-the-linear-module-seems-to-do-unnecessary-transposing/6277/7
         # We may want to do the same
         self.z, self.bias = self.manifold.construct_dl_parameters(
             in_features=in_features, out_features=out_features, bias=self.has_bias
         )
+        self.dropout = nn.Dropout(p=p_dropout)
+        self.impl = impl
 
         self.reset_parameters()
 
@@ -42,5 +40,5 @@ class HLinear(nn.Module):
         check_if_manifolds_match(layer=self, input=x)
         check_if_man_dims_match(layer=self, man_dim=-1, input=x)
         return self.manifold.fully_connected(
-            x=x, z=self.z, bias=self.bias, num_heads=self.num_heads
+            x=x, z=self.z, bias=self.bias, l=3.5, dropout=self.dropout, impl=self.impl
         )

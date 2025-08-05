@@ -87,7 +87,8 @@ def midpoint(
 
     # 2. Calculate the denominator for projection: sqrt(c) * ||numerator||_L
     # Add epsilon for numerical stability.
-    denominator = (c.sqrt() * diag.abs().sqrt()).unsqueeze(-1) + 1e-8
+    clamped_diag = torch.clamp(diag.abs(), min=1e-12)
+    denominator = (c.sqrt() * clamped_diag.sqrt()).unsqueeze(-1) + 1e-8
 
     # 3. Perform the projection.
     midpoint = numerator / denominator

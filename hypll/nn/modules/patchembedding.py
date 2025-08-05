@@ -35,7 +35,6 @@ class HPatchEmbedding(Module):
         self.manifold.reset_parameters(self.z, bias=None)
 
     def forward(self, x: torch.Tensor) -> ManifoldTensor:
-        self.pos_enc = self.pos_enc.to(device=x.device)
         return self.manifold.patch_embedding(
             x=x, z=self.z, positional_encoding=self.pos_enc, patch_size=self.patch_size
         )

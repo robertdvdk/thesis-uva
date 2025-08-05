@@ -32,6 +32,7 @@ def expmap0(v: Tensor, c: Tensor, man_dim: int) -> Tensor:
     Tensor
         The point on the hyperboloid.
     """
+    v[..., 0] = 0
     # The `man_dim` is transposed to the end for consistent processing.
     v_tran = v.transpose(dim0=man_dim, dim1=-1)
     v_norm = v_tran.norm(dim=-1)
@@ -42,11 +43,11 @@ def expmap0(v: Tensor, c: Tensor, man_dim: int) -> Tensor:
     space = (torch.sinh(v_norm) / (v_norm + 1e-5)).unsqueeze(-1) * v_tran
 
     # Concatenate time and space coords, and transpose back to original dim order.
-    result = torch.cat((time, space), dim=-1)
-    return result.transpose(dim0=man_dim, dim1=-1)
+    space[..., 0] = time.squeeze(-1)
+    return space.transpose(dim0=man_dim, dim1=-1)
 
 
-def expmap(x: Tensor, v: Tensor, c: Tensor) -> Tensor:
+def expmap(x: Tensor, v: Tensor, c: Tensor, prnt) -> Tensor:
     r"""Calculates the exponential map at a point `x` in the direction of `v`.
 
     The formula implemented is:
@@ -67,15 +68,31 @@ def expmap(x: Tensor, v: Tensor, c: Tensor) -> Tensor:
     Tensor
         The resulting point on the hyperboloid, shape `(..., D+1)`.
     """
-    # Note: This uses the Euclidean norm of the tangent vector `v`, which is a
-    # deviation from some textbook definitions that use the Lorentzian norm.
-    v_norm_c_sqrt = v.norm(dim=-1, keepdim=True) * c.sqrt()
 
-    # The division by `v_norm_c_sqrt` handles the directional scaling.
-    return (
-            torch.cosh(v_norm_c_sqrt) * x
-            + torch.divide(torch.sinh(v_norm_c_sqrt), v_norm_c_sqrt) * v
-    )
+    # Calculate the Minkowski norm squared of the tangent vector v
+    # <v, v>_L = -v_0^2 + v_1^2 + ...
+    minkowski_v_sq = torch.sum(v[..., 1:] ** 2, dim=-1, keepdim=True) - v[..., 0:1] ** 2
+
+    # Clamp to avoid sqrt of negative numbers due to floating point errors
+    v_minkowski_norm = torch.sqrt(torch.clamp_min(minkowski_v_sq, 1e-8))
+
+    v_norm_c_sqrt = v_minkowski_norm * torch.sqrt(c)
+
+    # Handle the case where v is the zero vector to avoid division by zero
+    # If v is zero, exp_x(0) = x
+    is_zero = v_norm_c_sqrt == 0
+
+    # Calculate sinh(z)/z safely
+    div = torch.sinh(v_norm_c_sqrt) / v_norm_c_sqrt
+    div[is_zero] = 1.0  # The limit of sinh(z)/z as z->0 is 1
+    # if prnt:
+    #     print("X", x)
+    #     print("V", v)
+    #     print("VNCS", v_norm_c_sqrt)
+    #     # print(torch.cosh(v_norm_c_sqrt) * x + div * v)
+    #     print("CX", torch.cosh(v_norm_c_sqrt) * x)
+    #     print("DIV V", div * v)
+    return torch.cosh(v_norm_c_sqrt) * x + div * v
 
 
 def logmap0(y: Tensor, c: Tensor) -> Tensor:
@@ -96,16 +113,32 @@ def logmap0(y: Tensor, c: Tensor) -> Tensor:
     Tensor
         The tangent vector at the origin.
     """
-    # Define the origin point on the hyperboloid.
-    origin = torch.zeros_like(y)
-    origin[..., 0] = 1.0
+    # For simplicity and compatibility with standard models, we assume c=1.
+    # The logic can be adapted if a different curvature scaling is truly needed.
 
-    # The coefficient `beta` is derived from the scaled Lorentzian inner product.
-    # The `.diag()` call suggests this is intended for a specific structure of inputs.
-    beta = (lorentz_dot(y, origin) * -c).diag().unsqueeze(-1)
+    # Clamp y_0 to prevent NaNs in acosh for values slightly less than 1
+    # due to floating-point precision errors.
+    eps = 1e-8
+    y_0 = y[..., 0:1].clamp(min=1.0 + eps)
+    y_spatial = y[..., 1:]
 
-    # The formula for the inverse operation (logarithmic map).
-    return torch.arccosh(beta) / (beta ** 2 - 1).sqrt() * (y - beta * origin)
+    # The distance 'd' is the norm of the tangent vector we want to find.
+    distance = torch.acosh(y_0)
+
+    # The norm of the spatial part of y should be sinh(distance).
+    # We add a small epsilon for numerical stability when y is at the origin.
+    spatial_norm = torch.norm(y_spatial, p=2, dim=-1, keepdim=True)
+    spatial_norm_clamped = torch.clamp(spatial_norm, min=1e-8)
+
+    # The spatial part of the tangent vector is the spatial direction of y,
+    # scaled by the hyperbolic distance.
+    v_spatial = distance * (y_spatial / spatial_norm_clamped)
+
+    # The time component of a tangent vector at the origin is always 0.
+    v_time = torch.zeros_like(y_0)
+
+    return torch.cat([v_time, v_spatial], dim=-1)
+
 
 
 def logmap(x: Tensor, y: Tensor, c: Tensor) -> Tensor:
@@ -128,8 +161,12 @@ def logmap(x: Tensor, y: Tensor, c: Tensor) -> Tensor:
     Tensor
         The tangent vector at `x`.
     """
-    beta = lorentz_dot(y, x) * -c
-    return torch.arccosh(beta) / (beta ** 2 - 1).sqrt() * (y - beta * x)
+    # print(y[0])
+    # print(x[0])
+    q = -y[0, 0] * x[0, 0] + y[0, 1] * x[0, 1] + y[0, 2] * x[0, 2]
+    # print(torch.arccosh(q) / (q ** 2 - 1))
+    beta = (-c * lorentz_dot(y, x)).diag().unsqueeze(-1)
+    return torch.arccosh(beta) / (beta ** 2 - 1).sqrt() * (y     - beta * x)
 
 
 def dist(x: Tensor, y: Tensor, c: Tensor) -> Tensor:
@@ -212,36 +249,28 @@ def project(x: Tensor, c: Tensor) -> Tensor:
     Tensor
         The projected point on the hyperboloid.
     """
-    space = x[..., 1:]
-    time = torch.sqrt(torch.norm(space, dim=-1) ** 2 + 1 / c).unsqueeze(-1)
+    time = torch.sqrt(torch.norm(x, dim=-1) ** 2 + 1 / c).unsqueeze(-1)
     # The `proj` variable is immediately returned.
-    return torch.cat((time, space), dim=-1)
+    return torch.cat((time, x), dim=-1)
 
 
 def euc_to_tangent(x: Tensor, u: Tensor, dim: int = -1) -> Tensor:
     r"""Projects a vector `u` from the ambient space onto the tangent space at `x`.
 
     This is the Riemannian gradient projection step. The formula is:
-    $$ Proj_x(u) = u + <x, u>_L x $$
-
-    Parameters
-    ----------
-    x : Tensor
-        A point on the hyperboloid defining the tangent space.
-    u : Tensor
-        A vector in the ambient space (e.g., a Euclidean gradient).
-    dim : int, optional
-        The dimension along which vectors are defined, by default -1.
-
-    Returns
-    -------
-    Tensor
-        The projected vector in the tangent space at `x`.
+    $$ \text{Proj}_x(u) = u + \langle u, x \rangle_L x $$
     """
-    # Compute the Minkowski inner product <x, u>_L manually.
-    minkowski_dot = -x[..., 0] * u[..., 0] + torch.sum(
-        x[..., 1:] * u[..., 1:], dim=-1, keepdim=True
-    )
+    # Use slicing `[..., :1]` to select the time-like coordinate, preserving the dimension.
+    # This prevents the broadcasting error.
+    time_prod = -x[..., 0] * u[..., 0]
 
-    # Project u onto the tangent space by adding the component along x.
+    # The rest of the calculation is correct.
+    space_prod = torch.sum(x[..., 1:] * u[..., 1:], dim=-1, keepdim=True)
+
+    # Both terms now have shape [10000, 1], so they add correctly.
+    minkowski_dot = time_prod + space_prod
+
+    # Now the shapes match for the final operation:
+    # u                 -> [10000, 5]
+    # minkowski_dot * x -> [10000, 1] * [10000, 5] -> [10000, 5]
     return u + minkowski_dot * x

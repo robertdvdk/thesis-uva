@@ -1,5 +1,3 @@
-# train_compare.py
-
 """
 Main training script for the Transformer model.
 
@@ -97,11 +95,9 @@ def evaluate(model: nn.Module, criterion: nn.Module,
             tgt = batch['labels'].to(device)
             src_padding_mask = batch['attention_mask'].to(device)
 
-            # --- STANDARD TRANSLATION SETUP ---
             tgt_input = tgt[:, :-1].clone()
             tgt_out = tgt[:, 1:].clone()
 
-            # --- FIX: Sanitize the decoder input ---
             # Replace any -100 values with the padding token ID before passing to the model.
             # The model should not see the ignore_index.
             tgt_input[tgt_input == criterion.ignore_index] = pad_token_id
@@ -110,7 +106,6 @@ def evaluate(model: nn.Module, criterion: nn.Module,
             tgt_out[tgt[:, 1:] == pad_token_id] = criterion.ignore_index
 
             logits = model(src, tgt_input, src_padding_mask, tgt_padding_mask)
-            # --- END STANDARD SETUP ---
 
             loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
             total_loss += loss.item()
@@ -170,11 +165,10 @@ def main():
     if CONFIG["manifold"] == "hyperboloid":
         manifold = Hyperboloid(Curvature(value=np.log(np.exp(1) - 1)))
 
-    # --- MODIFICATION START ---
     run_name = CONFIG.get("run_name")
     if run_name is None:
         run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    checkpoint_dir = os.path.join("checkpoints2", run_name)
+    checkpoint_dir = os.path.join("checkpoints", run_name)
 
     # Abort if the checkpoint directory already exists to prevent overwriting.
     if os.path.isdir(checkpoint_dir):
@@ -184,7 +178,6 @@ def main():
 
     # Create the new checkpoint directory.
     os.makedirs(checkpoint_dir)
-    # --- MODIFICATION END ---
 
     log_path = os.path.join(checkpoint_dir, "training_log.txt")
     logger = Logger(log_path)
@@ -271,12 +264,6 @@ def main():
 
     logger.log("\n--- Starting Training ---")
 
-    # --- GRADIENT ACCUMULATION SETUP ---
-    accumulation_steps = CONFIG.get("accumulation_steps", 1)
-    if accumulation_steps > 1:
-        logger.log(f"--- Using gradient accumulation with {accumulation_steps} steps. ---")
-        logger.log(f"--- Effective batch size: {CONFIG['tokens_per_batch'] * accumulation_steps} tokens ---")
-    # --- END ACCUMULATION SETUP ---
 
     max_steps = CONFIG["max_steps"]
     eval_interval = CONFIG["eval_interval"]
@@ -286,8 +273,7 @@ def main():
     training_complete = False
     param_to_name = {param: name for name, param in model.named_parameters()}
     start_interval_time = time.time()
-    optimizer.zero_grad()  # Initialize gradients to zero before the loop
-    rnmax = 0
+    optimizer.zero_grad()
     while g_step < max_steps and not training_complete:
         for batch_idx, batch in enumerate(train_loader):
             if g_step >= max_steps:
@@ -298,83 +284,65 @@ def main():
             tgt = batch['labels'].to(device)
             src_padding_mask = batch['attention_mask'].to(device)
 
-            # --- STANDARD TRANSLATION SETUP ---
             tgt_input = tgt[:, :-1].clone()
             tgt_out = tgt[:, 1:].clone()
 
-            # --- FIX: Sanitize the decoder input ---
             tgt_input[tgt_input == criterion.ignore_index] = pad_token_id
 
             tgt_padding_mask = (tgt_input != pad_token_id)
             tgt_out[tgt[:, 1:] == pad_token_id] = criterion.ignore_index
             logits = model(src, tgt_input, src_padding_mask, tgt_padding_mask)
-            # --- END STANDARD SETUP ---
 
             loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
 
-            # --- GRADIENT ACCUMULATION: Scale loss ---
-            loss = loss / accumulation_steps
             loss.backward()
 
-            print(lr_scheduler.get_last_lr())
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=CONFIG["max_grad_norm"])
+            optimizer.step(param_to_name)
+            lr_scheduler.step()
+            optimizer.zero_grad()  # Clear gradients after stepping
+            g_step += 1  # Increment global step counter only on optimizer update
 
-            # --- GRADIENT ACCUMULATION: Step optimizer only after N batches ---
-            if (batch_idx + 1) % accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=CONFIG["max_grad_norm"])
-                rn = optimizer.step(param_to_name)
-                if rn > rnmax:
-                    rnmax = rn
-                print(rn)
-                lr_scheduler.step()
-                optimizer.zero_grad()  # Clear gradients after stepping
-                g_step += 1  # Increment global step counter only on optimizer update
+            if g_step > 0 and g_step % eval_interval == 0:
+                interval_time = time.time() - start_interval_time
+                current_lr = lr_scheduler.get_last_lr()[0]
 
-                # --- LOGGING & EVALUATION (Inside the accumulation step) ---
-                if g_step > 0 and g_step % eval_interval == 0:
-                    interval_time = time.time() - start_interval_time
-                    current_lr = lr_scheduler.get_last_lr()[0]
+                logger.log("-" * 50)
+                logger.log(f"Step: {g_step}/{max_steps} | LR: {current_lr:.6f} | "
+                           f"Interval Time: {interval_time:.2f}s | Train Loss: {loss.item():.3f}")
+                start_interval_time = time.time()
 
-                    # Note: loss.item() is from the scaled loss of the last mini-batch.
-                    # To get the "true" loss for logging, we multiply it back.
-                    unscaled_loss = loss.item() * accumulation_steps
-                    logger.log("-" * 50)
-                    logger.log(f"Step: {g_step}/{max_steps} | LR: {current_lr:.6f} | "
-                               f"Interval Time: {interval_time:.2f}s | Train Loss: {unscaled_loss:.3f}")
-                    start_interval_time = time.time()
+                val_loss, val_acc, val_ppl = evaluate(
+                    model, criterion, val_loader, device, tokenizer
+                )
+                logger.log(
+                    f"\tVal. Loss: {val_loss:.3f} |  Val. Acc: {val_acc * 100:.2f}% |  Val. PPL: {val_ppl:7.3f}")
 
-                    val_loss, val_acc, val_ppl = evaluate(
-                        model, criterion, val_loader, device, tokenizer
-                    )
-                    print(f"RNMAX: {rnmax:.3f}")
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    epochs_without_improvement = 0
+                    best_model_path = os.path.join(checkpoint_dir, f"best_model.pth")
+                    torch.save({
+                        'g_step': g_step,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': lr_scheduler.state_dict(),
+                        'loss': val_loss,
+                    }, best_model_path)
+                    logger.log(f"\t -> New best model saved to {best_model_path}")
+                else:
+                    epochs_without_improvement += 1
                     logger.log(
-                        f"\t RNMAX: {rnmax:.3f} | Val. Loss: {val_loss:.3f} |  Val. Acc: {val_acc * 100:.2f}% |  Val. PPL: {val_ppl:7.3f}")
+                        f"\t -> No improvement in validation loss for {epochs_without_improvement} consecutive evaluation(s).")
 
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        epochs_without_improvement = 0
-                        best_model_path = os.path.join(checkpoint_dir, f"best_model.pth")
-                        torch.save({
-                            'g_step': g_step,
-                            'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': lr_scheduler.state_dict(),
-                            'loss': val_loss,
-                        }, best_model_path)
-                        logger.log(f"\t -> New best model saved to {best_model_path}")
-                    else:
-                        epochs_without_improvement += 1
-                        logger.log(
-                            f"\t -> No improvement in validation loss for {epochs_without_improvement} consecutive evaluation(s).")
+                if epochs_without_improvement >= early_stopping_patience:
+                    logger.log(
+                        f"\n--- Early stopping triggered after {epochs_without_improvement} evaluations without improvement. ---")
+                    training_complete = True
+                    break  # Break from the inner batch loop
 
-                    if epochs_without_improvement >= early_stopping_patience:
-                        logger.log(
-                            f"\n--- Early stopping triggered after {epochs_without_improvement} evaluations without improvement. ---")
-                        training_complete = True
-                        break  # Break from the inner batch loop
-
-                    model.train()
-                    logger.log("-" * 50)
-            # --- END GRADIENT ACCUMULATION BLOCK ---
+                model.train()
+                logger.log("-" * 50)
 
     final_model_path = os.path.join(checkpoint_dir, "final_model.pth")
     torch.save({

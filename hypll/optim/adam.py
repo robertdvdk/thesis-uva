@@ -2,6 +2,7 @@ from collections.abc import Iterable
 from typing import Union
 
 from torch import max, no_grad, zeros_like
+import torch
 from torch.optim import Optimizer
 
 from hypll.manifolds import Manifold
@@ -18,6 +19,7 @@ class RiemannianAdam(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0,
         amsgrad: bool = False,
+        correction: bool = False,
     ) -> None:
         if lr < 0.0:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -36,6 +38,7 @@ class RiemannianAdam(Optimizer):
             eps=eps,
             weight_decay=weight_decay,
             amsgrad=amsgrad,
+            correction=correction,
         )
         super(RiemannianAdam, self).__init__(params=params, defaults=defaults)
 
@@ -48,6 +51,7 @@ class RiemannianAdam(Optimizer):
                 eps = group["eps"]
                 lr = group["lr"]
                 amsgrad = group["amsgrad"]
+                correction = group["correction"]
                 for param in group["params"]:
                     if isinstance(param, ManifoldParameter):
                         manifold: Manifold = param.manifold
@@ -74,12 +78,8 @@ class RiemannianAdam(Optimizer):
                         grad.tensor.add_(param.tensor, alpha=weight_decay)
                         grad = manifold.euc_to_tangent(x=param, u=grad)
                         exp_avg.mul_(betas[0]).add_(grad.tensor, alpha=1 - betas[0])
-                        exp_avg_sq.mul_(betas[1]).add_(
-                            manifold.inner(
-                                u=grad, v=grad, keepdim=True, safe_mode=False
-                            ),
-                            alpha=1 - betas[1],
-                        )
+                        squared_grad_norm = manifold.inner(u=grad, v=grad, keepdim=True, safe_mode=False)
+                        exp_avg_sq.mul_(betas[1]).add_(squared_grad_norm, alpha=1 - betas[1])
                         bias_correction1 = 1 - betas[0] ** state["step"]
                         bias_correction2 = 1 - betas[1] ** state["step"]
 
@@ -89,8 +89,15 @@ class RiemannianAdam(Optimizer):
                             denom = max_exp_avg_sq.div(bias_correction2).sqrt_()
                         else:
                             denom = exp_avg_sq.div(bias_correction2).sqrt_()
+
+                        if correction and param.dim() > 1:
+                            row_norms = param.data.norm(p=2, dim=1, keepdim=True)
+                            effective_lr = lr * row_norms
+                        else:
+                            effective_lr = lr
+
                         direction = (
-                            -lr * exp_avg.div(bias_correction1) / denom.add_(eps)
+                            -effective_lr * exp_avg.div(bias_correction1) / denom.add_(eps)
                         )
                         direction = TangentTensor(
                             data=direction,
@@ -106,10 +113,8 @@ class RiemannianAdam(Optimizer):
                         )
                         new_param = manifold.expmap(direction)
                         exp_avg_new = manifold.transp(v=exp_avg_man, y=new_param)
-
                         param.tensor.copy_(new_param.tensor)
                         exp_avg.copy_(exp_avg_new.tensor)
-
                     else:
                         grad = param.grad
                         if grad is None:
@@ -139,7 +144,6 @@ class RiemannianAdam(Optimizer):
                             denom = max_exp_avg_sq.div(bias_correction2).sqrt_()
                         else:
                             denom = exp_avg_sq.div(bias_correction2).sqrt_()
-
                         direction = exp_avg.div(bias_correction1) / denom.add_(eps)
 
                         new_param = param - lr * direction

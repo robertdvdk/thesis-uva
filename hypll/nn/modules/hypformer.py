@@ -25,7 +25,6 @@ class HypLayerNorm(nn.Module):
         x_space = x[..., 1:]
         x_space = self.layer(x_space)
 
-        # x_space = self.layer(x_space) / 2
         x_time = ((x_space ** 2).sum(dim=-1, keepdims=True) + 1).sqrt()
         x = torch.cat([x_time, x_space], dim=-1)
         return ManifoldTensor(data=x, manifold=self.manifold, man_dim=-1)
@@ -43,19 +42,29 @@ class HypNormalization(nn.Module):
 
         return x
 
+class HypResidual(nn.Module):
+    def __init__(self, manifold):
+        super(HypResidual, self).__init__()
+        self.manifold = manifold
+
+    def forward(self, x: ManifoldTensor, y: ManifoldTensor):
+        x_space = x.tensor[..., 1:] + y.tensor[..., 1:]
+        x_time = ((x_space ** 2).sum(dim=-1, keepdims=True) + 1).sqrt()
+        x = ManifoldTensor(torch.cat([x_time, x_space], dim=-1), manifold=self.manifold, man_dim=-1)
+        return x
 
 class HypActivation(nn.Module):
-    def __init__(self, activation):
+    def __init__(self, activation, manifold):
         super(HypActivation, self).__init__()
         self.activation = activation
+        self.manifold = manifold
 
     def forward(self, x):
-        x_space = x[..., 1:]
+        x_space = x[..., 1:].tensor
         x_space = self.activation(x_space)
         x_time = ((x_space ** 2).sum(dim=-1, keepdims=True) + 1).sqrt()
         x = torch.cat([x_time, x_space], dim=-1)
-
-        return x
+        return ManifoldTensor(data=x, manifold=self.manifold, man_dim=-1)
 
 
 class HypDropout(nn.Module):
@@ -63,14 +72,15 @@ class HypDropout(nn.Module):
         super(HypDropout, self).__init__()
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, training=False):
-        if training:
-            x_space = x[..., 1:]
-            x_space = self.dropout(x_space)
-            x_time = ((x_space ** 2).sum(dim=-1, keepdims=True) + 1).sqrt()
-            x = torch.cat([x_time, x_space], dim=-1)
-
-        return x
+    def forward(self, x: ManifoldTensor):
+        if not self.training:
+            return x
+        x_space = x.tensor[..., 1:]
+        x_space_dropped = self.dropout(x_space)
+        c = x.manifold.c()
+        x_time = ((x_space ** 2).sum(dim=-1, keepdims=True) + 1.0 / c).sqrt()
+        new_tensor_data = torch.cat([x_time, x_space_dropped], dim=-1)
+        return ManifoldTensor(data=new_tensor_data, manifold=x.manifold, man_dim=x.man_dim)
 
 
 class HypLinear(nn.Module):
@@ -107,16 +117,16 @@ class HypLinear(nn.Module):
 
 
 class HypCLS(nn.Module):
-    def __init__(self, manifold, in_features, out_features, bias=True):
+    def __init__(self, manifold, in_channels, out_channels, bias=True):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.manifold = manifold
-        cls_emb = torch.randn((self.out_features, self.in_features)) * (1. / math.sqrt(self.in_features + 1))
-        cls_emb = expmap0(cls_emb, c=self.manifold.c.value, man_dim=1)
+        cls_emb = torch.randn((self.out_channels, self.in_channels + 1)) * (1. / math.sqrt(self.in_channels + 1))
+        cls_emb = expmap0(cls_emb, c=self.manifold.c, man_dim=-1)
         self.cls = ManifoldParameter(cls_emb, self.manifold, man_dim=-1, requires_grad=True)
         if bias:
-            self.bias = nn.Parameter(torch.zeros(self.out_features))
+            self.bias = nn.Parameter(torch.zeros(self.out_channels))
 
     def forward(self, x, return_type='neg_dist'):
         dist = -2 * 1 - 2 * lorentz_dot(x.tensor, self.cls.tensor) + self.bias

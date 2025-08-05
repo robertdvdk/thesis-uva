@@ -1,5 +1,3 @@
-# evaluate.py
-
 """
 Optimized evaluation script for the Transformer model.
 

@@ -304,7 +304,7 @@ class HTransformerEncoderLayer(nn.Module):
             self.dropout = HypDropout(dropout)
             self.norm1 = HypLayerNorm(manifold, d_model)
             self.norm2 = HypLayerNorm(manifold, d_model)
-            self.res = HypResidual()
+            self.res = HypResidual(manifold=self.manifold)
             self.relu = HypActivation(torch.nn.functional.relu, manifold=self.manifold)
 
 
@@ -349,7 +349,7 @@ class HTransformerDecoderLayer(nn.Module):
             self.norm1 = HypLayerNorm(manifold, d_model)
             self.norm2 = HypLayerNorm(manifold, d_model)
             self.norm3 = HypLayerNorm(manifold, d_model)
-            self.res = HypResidual()
+            self.res = HypResidual(manifold=self.manifold)
             self.relu = HypActivation(torch.nn.functional.relu, manifold=self.manifold)
 
     def forward(self, tgt: ManifoldTensor, memory: ManifoldTensor,
@@ -401,14 +401,7 @@ class HSeq2SeqTransformer(nn.Module):
             HTransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, manifold, impl=impl)
             for _ in range(num_decoder_layers)
         ])
-        # if gen_impl == "LorentzMLR":
-        #     self.generator = LorentzMLR(manifold=self.manifold, num_features=d_model + 1, num_classes=tgt_vocab_size)
-        # elif gen_impl == "HLinear":
-        #     self.generator = HLinear(d_model, tgt_vocab_size, manifold, impl=impl)
-        # elif gen_impl == "Linear":
         self.generator = nn.Linear(d_model + 1, tgt_vocab_size)
-        # else:
-        #     raise NotImplementedError
 
 
     def generate_square_subsequent_mask(self, sz: int, device: torch.device) -> torch.Tensor:
@@ -457,9 +450,5 @@ class HSeq2SeqTransformer(nn.Module):
         # Run through encoder, decoder, and final generator
         memory = self.encode(src, src_padding_mask)
         outs = self.decode(tgt, memory, tgt_mask, tgt_padding_mask, src_padding_mask)
-        # if self.gen_impl == "HLinear":
-        #     ret = self.generator(outs)
-        #     return ret.tensor[..., 1:]
-        # else:
         ret = self.generator(outs.tensor)
         return ret

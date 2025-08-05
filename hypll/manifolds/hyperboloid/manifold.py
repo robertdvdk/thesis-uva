@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor, empty
 from torch.nn import Parameter
+import torch.nn as nn
 from torch.nn.common_types import _size_2_t
 from torch.nn.functional import unfold
 
@@ -25,14 +26,15 @@ from .math.diffgeom import (
     logmap,
     logmap0,
     project,
+    euc_to_tangent
 )
 from .math.linalg import (
-    lorentz_fully_connected,
     squared_lorentzian_distance,
-    lorentz_patch_embedding,
 )
 from .math.stats import midpoint
 
+import torch.nn.functional as F
+import sys
 
 class Hyperboloid(Manifold):
     """Class representing the Hyperboloid model of hyperbolic space.
@@ -59,10 +61,10 @@ class Hyperboloid(Manifold):
         self.c = c
 
     def project(self, x: ManifoldTensor, eps: float = -1.0) -> ManifoldTensor:
-        new_tensor = project(x=x.tensor, c=self.c(), dim=x.man_dim)
+        new_tensor = project(x=x.tensor, c=self.c())
         return ManifoldTensor(data=new_tensor, manifold=self, man_dim=x.man_dim)
 
-    def expmap(self, v: TangentTensor) -> ManifoldTensor:
+    def expmap(self, v: TangentTensor, prnt=False) -> ManifoldTensor:
         """Takes in a TangentTensor and returns a ManifoldTensor corresponding to the exponential map
         of the input tensor. If the tangent vectors have corresponding points on the manifold, those
         are used as the "starting point" for the exponential map. Otherwise, the exponential map is
@@ -83,7 +85,7 @@ class Hyperboloid(Manifold):
             new_tensor = expmap0(v=v.tensor, c=self.c(), man_dim=man_dim)
         else:
             new_tensor = expmap(
-                x=v.manifold_points.tensor, v=v.tensor, c=self.c(), man_dim=man_dim
+                x=v.manifold_points.tensor, v=v.tensor, c=self.c(), prnt=prnt
             )
         return ManifoldTensor(data=new_tensor, manifold=self, man_dim=man_dim)
 
@@ -135,114 +137,103 @@ class Hyperboloid(Manifold):
         dim = check_dims_with_broadcasting(x, y)
         return dist(x=x.tensor, y=y.tensor, c=self.c(), dim=dim)
 
-    def fully_connected(
-        self,
-        x: ManifoldTensor,
-        z: ManifoldTensor,
-        bias: Optional[Tensor],
-        num_heads: Optional[int],
-    ) -> ManifoldTensor:
-        """
-        Computes Lorentzian fully connected layer according to the formulation in Chen et al. (2021).
+    def fully_connected(self, x: ManifoldTensor, z: ManifoldTensor, bias: Optional[Tensor], l: float, dropout: nn.Module, impl: str):
+        if impl == "tangent":
+            space = self.logmap(y=x).tensor @ z.tensor.T
+            if bias is not None:
+                space += bias
+            time = torch.zeros(space.shape[:-1], device=x.device).unsqueeze(-1)
+            tangent = TangentTensor(data=torch.cat([time, space], dim=x.man_dim), manifold=self, man_dim=x.man_dim)
+            return self.expmap(tangent)
+        elif impl == "naive" or impl == "correction":
+            space = x.tensor @ z.tensor.T
+            if bias is not None:
+                space += bias
+            time = torch.sqrt(torch.norm(space, p=2, dim=x.man_dim, keepdim=True) ** 2 + 1.0 / self.c())
+            return ManifoldTensor(torch.cat([time, space], dim=x.man_dim), manifold=self, man_dim=x.man_dim)
+        elif impl == "chen":
+            vT = z.tensor[0]
+            W = z.tensor[1:]
+            bias = bias.squeeze()
+            b_0 = bias[0]
+            eps = (1. / self.c()).sqrt() + 1e-6
+            time = l * F.sigmoid(x.tensor @ vT + b_0) + eps
+            num = (time ** 2 - 1. / self.c()).sqrt()
+            space_unnormalised = F.relu(dropout(x.tensor)) @ W.T
+            space = num.unsqueeze(x.man_dim) / space_unnormalised.norm(dim=x.man_dim, keepdim=True) * space_unnormalised
+            return ManifoldTensor(torch.cat([time.unsqueeze(dim=x.man_dim), space], dim=x.man_dim), manifold=self, man_dim=x.man_dim)
 
-        Parameters
-        ----------
-        x : ManifoldTensor
-            Input tensor, shape (B, L, D + 1).
-        z : ManifoldTensor
-            Weight tensor, shape (D, D + 1).
-        bias : Optional[Tensor]
-            Bias tensor, shape (D).
-        num_heads : Optional[int]
-            Used when the fully connected layer is used in the context of multi-head attention.
+    def multiheadattention(self,
+                           query: ManifoldTensor,
+                           key: ManifoldTensor,
+                           value: ManifoldTensor,
+                           att_module: nn.Module,
+                           impl: str,
+                           key_padding_mask: Optional[Tensor] = None,
+                           attn_mask: Optional[Tensor] = None):
+        if impl == "tangent":
+            query_tangent = self.logmap(y=query)
+            key_tangent = self.logmap(y=key)
+            value_tangent = self.logmap(y=value)
+            attn_output = torch.zeros_like(query_tangent.tensor)
+            attn_output[..., 1:], attn_output_weights = att_module(query=query_tangent.tensor[..., 1:], key=key_tangent.tensor[..., 1:], value=value_tangent.tensor[..., 1:], key_padding_mask=key_padding_mask, attn_mask=attn_mask)
 
-        Returns
-        -------
-        ManifoldTensor
-            Output tensor, shape (B, L, D + 1).
-        """
-        new_tensor = lorentz_fully_connected(
-            x=x.tensor,
-            W=z.tensor,
-            bias=bias,
-            c=self.c(),
-            num_heads=num_heads,
-        )
-        man_dim = (
-            x.man_dim + 1 if num_heads > 1 else x.man_dim
-        )  # Update manifold dimension in case of multi-head attention.
-        return ManifoldTensor(data=new_tensor, manifold=self, man_dim=man_dim)
+            output_tangent = TangentTensor(attn_output, manifold=self, man_dim=query.man_dim)
+            output = self.expmap(output_tangent)
+            return attn_output
+        elif impl == "naive" or impl == "correction":
+            # The "naive" implementation follows the algorithm outlined in
+            # "Fully Hyperbolic Neural Networks" by Chen et al. (2022).
+            # It computes attention weights based on squared Lorentzian distance
+            # and aggregates values by finding the Lorentz centroid.
 
-    def multiheadattention(
-        self,
-        query: ManifoldTensor,
-        key: ManifoldTensor,
-        value: ManifoldTensor,
-        W_Q: torch.nn.Module,
-        W_K: torch.nn.Module,
-        W_V: torch.nn.Module,
-        W_O: torch.nn.Module,
-    ) -> ManifoldTensor:
-        """
-        Computes Lorentzian multi-head attention according to the formulation in Chen et al. (2021).
+            # Get the spatial dimension 'n' for the scaling factor, as per eq. [cite_start](5)[cite: 153].
+            n = query.shape[-1] - 1
 
-        Parameters
-        ----------
-        query : ManifoldTensor
-            ManifoldTensor of shape (B, L, D + 1) representing the query tensor.
-        key : ManifoldTensor
-            ManifoldTensor of shape (B, L, D + 1) representing the key tensor.
-        value : ManifoldTensor
-            ManifoldTensor of shape (B, L, D + 1) representing the value tensor.
-        W_Q : torch.nn.Module
-            Hyperboloid linear layer for the query tensor.
-        W_K : torch.nn.Module
-            Hyperboloid linear layer for the key tensor.
-        W_V : torch.nn.Module
-            Hyperboloid linear layer for the value tensor.
-        W_O : torch.nn.Module
-            Hyperboloid linear layer for the output tensor.
+            # Calculate squared Lorentzian distance, as defined in the paper just before eq. [cite_start](4)[cite: 151].
+            # This is used to compute the attention scores.
+            sq_dist = squared_lorentzian_distance(query.tensor, key.tensor, self.c())
 
-        Returns
-        -------
-        ManifoldTensor
-            ManifoldTensor of shape (B, L, D + 1) representing the output tensor.
-        """
-        num_heads = W_Q.num_heads
-        query = W_Q.forward(query)  # (B, L, H, D + 1)
-        key = W_K.forward(key)  # (B, L, H, D + 1)
-        value = W_V.forward(value)  # (B, L, H, D + 1)
-        if num_heads > 1:
-            query = query.transpose(1, 2)
-            key = key.transpose(1, 2)
-            value = value.transpose(1, 2)
-        n = torch.tensor(
-            query.shape[-1] - 1
-        )  # Space dimension of the hyperboloid (time is not counted).
-        w = torch.nn.functional.softmax(
-            -squared_lorentzian_distance(query.tensor, key.tensor, self.c()) / n.sqrt(),
-            dim=-1,
-        )  # (B, H, L, L)
-        mu = self.midpoint(x=value, w=w, num_heads=num_heads)  # (B, L, D + 1)
-        Ox = W_O.forward(mu)  # (B, L, D + 1)
-        return Ox
+            # [cite_start]The attention score is the negative squared distance, scaled by sqrt(n)[cite: 153].
+            attn_scores = -sq_dist / (n ** 0.5)
 
-    def patch_embedding(
-        self, x: Tensor, z: ManifoldTensor, positional_encoding: Tensor, patch_size: int
-    ) -> ManifoldTensor:
-        new_tensor = lorentz_patch_embedding(
-            x=x,
-            weights=z.tensor,
-            positional_encoding=positional_encoding,
-            c=self.c(),
-            patch_size=patch_size,
-        )
-        return ManifoldTensor(data=new_tensor, manifold=self, man_dim=-1)
+            # Apply attention mask if provided.
+            if attn_mask is not None:
+                attn_scores += attn_mask
+
+            # Apply key padding mask if provided.
+            if key_padding_mask is not None:
+                attn_scores = attn_scores.masked_fill(
+                    key_padding_mask.unsqueeze(1),
+                    float("-inf"),
+                )
+
+            # Calculate attention weights using softmax, as per eq. [cite_start](5)[cite: 153].
+            attn_weights = F.softmax(attn_scores, dim=-1)
+
+            # Aggregate the value vectors by computing the Lorentz centroid, as per eq. [cite_start](4)[cite: 165].
+            # The `midpoint` function with weights performs this weighted aggregation and projection.
+            output_tensor = midpoint(
+                x=value.tensor,
+                c=self.c(),
+                w=attn_weights,
+                dim=None  # Use weighted aggregation mode
+            )
+
+            # Wrap the resulting tensor in a ManifoldTensor.
+            output = ManifoldTensor(
+                data=output_tensor,
+                manifold=self,
+                man_dim=query.man_dim
+            )
+
+            return output
 
     def midpoint(
         self,
         x: ManifoldTensor,
         w: Optional[Tensor] = None,
+        dim: Optional[int] = None,
         num_heads: Optional[int] = 1,
     ) -> ManifoldTensor:
         """
@@ -262,38 +253,22 @@ class Hyperboloid(Manifold):
         ManifoldTensor
             _description_
         """
-        # print("Mu before", x.tensor[:, :, 0, 1])
         mu = midpoint(
             x=x.tensor,
             c=self.c(),
             w=w,
+            dim=dim,
         )  # (B, H, L, (D / H) + 1)
-        if num_heads > 1:
-            mu_space = mu[..., 1:].reshape(mu.shape[0], mu.shape[-2], -1)  # (B, L, D)
-            mu_time = torch.sqrt(
-                torch.norm(mu_space, dim=-1) ** 2 + 1 / self.c()
-            ).unsqueeze(-1)  # (B, L, 1)
-            mu = torch.cat([mu_time, mu_space], dim=-1)  # (B, L, D + 1)
-        man_dim = x.man_dim - 1 if num_heads > 1 else x.man_dim
+        mu_space = mu[..., 1:].reshape(mu.shape[0], mu.shape[-2], -1)  # (B, L, D)
+        mu_time = torch.sqrt(
+            torch.norm(mu_space, dim=-1) ** 2 + 1 / self.c()
+        ).unsqueeze(-1)  # (B, L, 1)
+        mu = torch.cat([mu_time, mu_space], dim=-1)  # (B, L, D + 1)
+        man_dim = x.man_dim - 1
         return ManifoldTensor(data=mu, manifold=self, man_dim=man_dim)
 
     def inner(self, u, v, dim=-1, keepdim=False, safe_mode=False):
         return self.minkowski_dot(u.tensor, v.tensor, dim=dim, keepdim=keepdim)
-
-    def minkowski_dot(
-        self, x: Tensor, y: Tensor, dim: int = -1, keepdim: bool = False
-    ) -> Tensor:
-        """
-        Computes the Minkowski dot product in (-, +, +, ..., +) signature
-        along the specified dimension 'dim'.
-        """
-        # Split off the first coordinate (time-like) and the remaining space-like coordinates
-        time_x, space_x = x.split([1, x.size(dim) - 1], dim=dim)
-        time_y, space_y = y.split([1, y.size(dim) - 1], dim=dim)
-
-        # Minkowski dot: - x0*y0 + sum_{i=1 to d} x_i*y_i
-        dot = -time_x * time_y + (space_x * space_y).sum(dim=dim, keepdim=keepdim)
-        return dot
 
     def euc_to_tangent(
         self, x: ManifoldTensor, u: ManifoldTensor, dim: int = -1
@@ -426,25 +401,73 @@ class Hyperboloid(Manifold):
     def cat(
         self,
         manifold_tensors: Union[Tuple[ManifoldTensor, ...], List[ManifoldTensor]],
+        impl: str,
         dim: int = 0,
     ) -> ManifoldTensor:
+        """
+        Concatenates a sequence of ManifoldTensors along a given dimension.
+
+        The behavior depends on the chosen implementation and whether the
+        concatenation is along the manifold dimension.
+
+        Parameters
+        ----------
+        manifold_tensors : Union[Tuple[ManifoldTensor, ...], List[ManifoldTensor]]
+            The sequence of tensors to concatenate.
+        impl : str
+            The implementation to use ("naive" or "tangent").
+        dim : int, optional
+            The dimension along which to concatenate, by default 0.
+
+        Returns
+        -------
+        ManifoldTensor
+            The resulting concatenated tensor.
+        """
         check_if_man_dims_match(manifold_tensors)
-        if dim == manifold_tensors[0].man_dim:
-            tangent_tensors = [self.logmap(None, t) for t in manifold_tensors]
-            ns = torch.tensor([t.shape[t.man_dim] for t in manifold_tensors])
-            n = ns.sum()
-            beta_ns = beta_func(ns / 2, 0.5)
-            beta_n = beta_func(n / 2, 0.5)
-            cat = torch.cat(
-                [
-                    (t.tensor * beta_n) / beta_n_i
-                    for (t, beta_n_i) in zip(tangent_tensors, beta_ns)
-                ],
-                dim=dim,
-            )
-            new_tensor = TangentTensor(data=cat, manifold=self, man_dim=dim)
-            return self.expmap(new_tensor)
+        man_dim = manifold_tensors[0].man_dim
+
+        # Resolve negative dim to its positive index equivalent.
+        ndim = manifold_tensors[0].tensor.ndim
+        resolved_dim = dim if dim >= 0 else ndim + dim
+
+        # --- Case 1: Concatenating along the manifold dimension ---
+        if resolved_dim == man_dim:
+            if impl == "naive" or impl == "correction":
+                # In the naive case, we concatenate the spatial dimensions and
+                # calculate a new time dimension to ensure the result is on the manifold.
+                tensors = [t.tensor for t in manifold_tensors]
+
+                # Extract and concatenate all spatial parts of the tensors.
+                # Assumes manifold dimension is the last one.
+                spatial_parts = [t.narrow(man_dim, 1, t.shape[man_dim] - 1) for t in tensors]
+                concatenated_spatial = torch.cat(spatial_parts, dim=man_dim)
+
+                # Calculate the required time dimension for the new concatenated vector.
+                # t = sqrt(||s||^2 + 1/c)
+                time_squared = torch.sum(torch.pow(concatenated_spatial, 2), dim=man_dim, keepdim=True) + (
+                            1.0 / self.c())
+                new_time = torch.sqrt(time_squared)
+
+                # Combine the new time dimension with the concatenated spatial part.
+                final_tensor = torch.cat([new_time, concatenated_spatial], dim=man_dim)
+                return ManifoldTensor(data=final_tensor, manifold=self, man_dim=man_dim)
+
+            elif impl == "tangent":
+                # In the tangent case, we map to the tangent space, perform a
+                # standard Euclidean concatenation, and map back.
+                tangent_tensors = [self.logmap(None, t) for t in manifold_tensors]
+                concatenated_tangent_data = torch.cat([t.tensor for t in tangent_tensors], dim=man_dim)
+
+                final_tangent = TangentTensor(data=concatenated_tangent_data, manifold=self, man_dim=man_dim)
+                return self.expmap(final_tangent)
+
+            else:
+                raise ValueError(f"Unknown implementation for cat: {impl}")
+
+        # --- Case 2: Concatenating along a non-manifold dimension ---
         else:
-            cat = torch.cat([t.tensor for t in manifold_tensors], dim=dim)
-            man_dim = manifold_tensors[0].man_dim
-            return ManifoldTensor(data=cat, manifold=self, man_dim=man_dim)
+            # If concatenating along any other dimension, the operation is a simple
+            # torch.cat, as it doesn't affect the manifold's structure.
+            cat_tensor = torch.cat([t.tensor for t in manifold_tensors], dim=dim)
+            return ManifoldTensor(data=cat_tensor, manifold=self, man_dim=man_dim)
